@@ -237,7 +237,7 @@ def main():
 
         print(f"\n{equal_line}")
         print(f" logic test-targets: platform analysis ".center(total_header_width, "="))
-        print(f"{'Name':<{name_col_width}} {'Stmts':>7} {'Logic':>7} {'Target%':>7}  {'Untested Logic Lines'}")
+        print(f"{'Name':<{name_col_width}} {'Stmts':>7} {'Logic':>7} {'Target%':>7}  {'Logic Lines'}")
         print(dash_line)
         
         grand_total_stmts = 0
