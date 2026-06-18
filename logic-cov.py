@@ -2,9 +2,14 @@
 
 import ast
 import sys
+import argparse
 from pathlib import Path
 
-# --- Słowa kluczowe ---
+# --- Metric models ---
+METRIC_LINE = "line"
+METRIC_STRUCT = "struct"
+
+# --- Key words ---
 GUI_HINTS = {
     "pack", "grid", "place", "bind", "config", "configure", 
     "StringVar", "BooleanVar", "IntVar", "DoubleVar", "PhotoImage",
@@ -44,23 +49,26 @@ class Analyzer(ast.NodeVisitor):
             parts = name.split(".")
             short = parts[-1]
 
+            # GUI verification
             if (
                 short in GUI_HINTS
                 or short in GUI_WIDGETS
-                or any(p in ["tk", "ttk", "theme", "style"] for p in parts)
+                or any(p.lower() in ["tk", "ttk", "theme", "style"] for p in parts)
             ):
                 self.gui += 1
 
-            if (
+            # LOGIC verification (precise segment matching instead of substrings)
+            elif (
                 short in LOGIC_HINTS 
-                or any(x in name for x in LOGIC_HINTS)
-                or any(p in ["os", "sys", "subprocess", "json", "pathlib", "re"] for p in parts)
+                or any(p in LOGIC_HINTS for p in parts)
+                or any(p.lower() in ["os", "sys", "subprocess", "json", "pathlib", "re"] for p in parts)
             ):
                 self.logic += 1
 
         self.generic_visit(node)
 
     def _name(self, node):
+        """Safely extracting the full qualified name (e.g., self.button.pack)"""
         if isinstance(node, ast.Name):
             return node.id
         if isinstance(node, ast.Attribute):
@@ -68,6 +76,9 @@ class Analyzer(ast.NodeVisitor):
             if base:
                 return f"{base}.{node.attr}"
             return node.attr
+        if isinstance(node, ast.Call):
+            # Handling call chains, e.g., get_widget().pack() -> extracting the trailing dot
+            return self._name(node.func)
         return None
 
 
@@ -95,160 +106,222 @@ def analyze_function(node):
     return kind, gui, logic
 
 
-def analyze_file_for_coverage(path):
+def process_file(path):
+    """Parses the file only ONCE and gathers all required statistics"""
     try:
         src = Path(path).read_text(encoding="utf-8")
         tree = ast.parse(src)
     except Exception:
         return None
 
-    total_func_lines = 0
-    logic_lines_count = 0
-    untested_ranges = []
+    file_results = {
+        "path": path,
+        "total_func_lines": 0,
+        "logic_lines_count": 0,
+        "untested_ranges": [],
+        "functions_vv": [],
+        "f_stats": {"GUI": 0, "LOGIC": 0, "MIXED": 0, "UNKNOWN": 0}
+    }
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            kind, _, _ = analyze_function(node)
+            kind, gui, logic = analyze_function(node)
             
             start_line = node.lineno
             end_line = getattr(node, "end_lineno", start_line)
             lines_in_func = (end_line - start_line) + 1
             
-            total_func_lines += lines_in_func
+            file_results["total_func_lines"] += lines_in_func
+            file_results["f_stats"][kind] += lines_in_func
             
             if kind in ("LOGIC", "MIXED"):
-                logic_lines_count += lines_in_func
-                untested_ranges.append((start_line, end_line))
+                file_results["logic_lines_count"] += lines_in_func
+                file_results["untested_ranges"].append((start_line, end_line))
+                
+            file_results["functions_vv"].append(
+                f"    {kind:7} | gui={gui:<3} logic={logic:<3} | {node.name}"
+            )
 
-    untested_ranges.sort()
+    # Line range formatting
+    file_results["untested_ranges"].sort()
     range_strings = []
-    for start, end in untested_ranges:
+    for start, end in file_results["untested_ranges"]:
         if start == end:
             range_strings.append(f"{start}")
         else:
             range_strings.append(f"{start}-{end}")
-    
-    missing_str = ", ".join(range_strings)
+    file_results["missing_str"] = ", ".join(range_strings)
 
-    return {
-        "total_lines": total_func_lines,
-        "logic_lines": logic_lines_count,
-        "missing_ranges": missing_str
-    }
+    return file_results
 
 
-def analyze_file_vv(path):
-    try:
-        src = Path(path).read_text(encoding="utf-8")
-        tree = ast.parse(src)
-    except Exception:
-        return []
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog="logic-scan",
+        description="GUI/LOGIC analyzer for Python projects"
+    )
+    parser.add_argument(
+        "paths", nargs="*", default=["."],
+        help="Files or directories to scan (default: current directory)"
+    )
+    parser.add_argument("-v", action="store_true", help="Show logic coverage targets")
+    parser.add_argument("-vv", action="store_true", help="Show function classification dump")
+    return parser.parse_args()
 
-    functions_output = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            kind, gui, logic = analyze_function(node)
-            functions_output.append(
-                f"    {kind:7} | gui={gui:<3} logic={logic:<3} | {node.name}"
-            )
-    return functions_output
+
+def collect_files(paths):
+    files = set()
+    for item in paths:
+        path = Path(item)
+        if path.is_file() and path.suffix == ".py":
+            files.add(path.resolve())
+        elif path.is_dir():
+            for f in path.rglob("*.py"):
+                files.add(f.resolve())
+    return sorted(files)
 
 
 def main():
-    # Pobieranie flag na wzór pytest
-    vv_mode = "-vv" in sys.argv
-    v_mode = "-v" in sys.argv and not vv_mode
+    args = parse_args()
+    files = collect_files(args.paths)
 
-    scripts_dir = Path("scripts")
-    if not scripts_dir.exists():
-        print("Błąd: Folder 'scripts' nie istnieje.")
-        sys.exit(1)
-
-    files = sorted(list(scripts_dir.glob("**/*.py")))
     if not files:
-        print("Nie znaleziono plików .py.")
+        print("No .py files found in the specified directory.")
         sys.exit(1)
 
-    # -------------------------------------------------------------
-    # OPCJA 1: FLAGA -v (Raport pokrycia / pytest-cov)
-    # -------------------------------------------------------------
+    # We analyze each file exactly once and store the results in memory
+    analyzed_data = []
+    for path in files:
+        data = process_file(path)
+        if data:
+            analyzed_data.append(data)
+
+    # --- OPTION 1: -v FLAG (Coverage report / pytest-cov) ---
+    # ---------------------------------------------------------------
+    # OPTION 1: Using the -v flag (Zabezpieczona przed rozjeżdżaniem)
+    # ---------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # OPTION 1: Using the -v flag (Zabezpieczona przed rozjeżdżaniem)
+    # ---------------------------------------------------------------
+    v_mode = args.v and not args.vv
+    
     if v_mode:
-        print(f"\n---------- logic test-targets: platform analysis -----------")
-        print(f"{'Name':<45} {'Stmts':>7} {'Logic':>7} {'Target%':>7}  {'Untested Logic Lines'}")
-        print("-" * 95)
+        current_dir = Path.cwd()
+        pre_computed_rows = []
+        
+        # Pierwsze przejście: przygotowanie danych i konwersja ścieżek
+        for data in analyzed_data:
+            # Próba skrócenia ścieżki do relatywnej
+            try:
+                display_name = str(data["path"].relative_to(current_dir))
+            except ValueError:
+                display_name = str(data["path"])
+                
+            target_pct = (100 * data["logic_lines_count"] / data["total_func_lines"]) if data["total_func_lines"] else 0.0
+            
+            pre_computed_rows.append({
+                "name": display_name,
+                "stmts": data["total_func_lines"],
+                "logic": data["logic_lines_count"],
+                "pct": f"{target_pct:>6.0f}%" if data["total_func_lines"] > 0 else f"{0:>6.0f}%",
+                "missing": data["missing_str"] if data["total_func_lines"] > 0 else ""
+            })
+
+        # Dynamiczne wyliczenie szerokości kolumny 'Name' (minimum 45 znaków)
+        name_col_width = max(45, max((len(r["name"]) for r in pre_computed_rows), default=45))
+        
+        # Wyliczenie łącznej szerokości linii dekoracyjnych
+        total_header_width = name_col_width + 50
+        equal_line = "=" * total_header_width
+        dash_line = "-" * total_header_width
+
+        print(f"\n{equal_line}")
+        print(f" logic test-targets: platform analysis ".center(total_header_width, "="))
+        print(f"{'Name':<{name_col_width}} {'Stmts':>7} {'Logic':>7} {'Target%':>7}  {'Untested Logic Lines'}")
+        print(dash_line)
         
         grand_total_stmts = 0
         grand_total_logic = 0
 
-        for path in files:
-            data = analyze_file_for_coverage(path)
-            if not data: continue
-                
-            grand_total_stmts += data["total_lines"]
-            grand_total_logic += data["logic_lines"]
-            target_pct = (100 * data["logic_lines"] / data["total_lines"]) if data["total_lines"] else 0.0
+        # Drugie przejście: renderowanie tabeli
+        for r in pre_computed_rows:
+            grand_total_stmts += r["stmts"]
+            grand_total_logic += r["logic"]
             
-            if data["total_lines"] > 0:
-                print(f"{str(path):<45} {data['total_lines']:>7} {data['logic_lines']:>7} {target_pct:>6.0f}%  {data['missing_ranges']}")
-            else:
-                print(f"{str(path):<45} {0:>7} {0:>7}   {0:>3}%")
+            print(f"{r['name']:<{name_col_width}} {r['stmts']:>7} {r['logic']:>7} {r['pct']}  {r['missing']}")
                 
-        print("-" * 95)
+        print(dash_line)
         total_pct = (100 * grand_total_logic / grand_total_stmts) if grand_total_stmts else 0.0
-        print(f"{'TOTAL':<45} {grand_total_stmts:>7} {grand_total_logic:>7} {total_pct:>6.0f}%")
-        print(f"\n==================== target scanning finished ====================\n")
+        print(f"{'TOTAL':<{name_col_width}} {grand_total_stmts:>7} {grand_total_logic:>7} {total_pct:>6.0f}%")
+        print(f"{equal_line}")
+        print(f" target scanning finished ".center(total_header_width, "="))
+        print()
         return
 
-    # -------------------------------------------------------------
-    # OPCJA 2: FLAGA -vv (Szczegółowy zrzut per funkcja)
-    # -------------------------------------------------------------
-    if vv_mode:
-        print(f"\n==================== verbose function dump ====================")
-        for path in files:
-            lines = analyze_file_vv(path)
-            if lines:
-                print(f"\nFILE: {path}")
+    # --- OPTION 2: -vv FLAG (Detailed per-function output) ---
+    if args.vv:
+        print(f"\n==================================== verbose function dump ====================================")
+        for data in analyzed_data:
+            if data["functions_vv"]:
+                print(f"\nFILE: {data['path']}")
                 print("  " + "-" * 60)
-                for line in lines:
+                for line in data["functions_vv"]:
                     print(line)
-        print(f"\n==================== end of function dump ====================\n")
+        print(f"\n===================================== end of function dump ====================================\n")
 
-    # -------------------------------------------------------------
-    # DOMYŚLNA TABELA PROCENTOWA (Dla braku flag oraz na końcu -vv)
+   # -------------------------------------------------------------
+    # DEFAULT PERCENTAGE TABLE (Zabezpieczona przed rozjeżdżaniem)
     # -------------------------------------------------------------
     table_rows = []
     total_counts = {"GUI": 0, "LOGIC": 0, "MIXED": 0, "UNKNOWN": 0}
     
-    for path in files:
-        try:
-            src = path.read_text(encoding="utf-8")
-            tree = ast.parse(src)
-        except:
-            continue
-        f_stats = {"GUI": 0, "LOGIC": 0, "MIXED": 0, "UNKNOWN": 0}
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                kind, _, _ = analyze_function(node)
-                f_stats[kind] += max(1, len(node.body))
-                
+    current_dir = Path.cwd()
+    
+    for data in analyzed_data:
+        f_stats = data["f_stats"]
         for k in total_counts: 
             total_counts[k] += f_stats[k]
             
         f_total = sum(f_stats.values())
+        
+        # Próba skrócenia ścieżki do relatywnej, by zaoszczędzić miejsce
+        try:
+            display_name = str(data["path"].relative_to(current_dir))
+        except ValueError:
+            display_name = str(data["path"]) # Jeśli plik jest poza CWD, zostaw absolutną
+
         table_rows.append((
-            str(path),
+            display_name,
             (100 * f_stats["GUI"] / f_total) if f_total else 0.0,
             (100 * f_stats["LOGIC"] / f_total) if f_total else 0.0,
             (100 * f_stats["MIXED"] / f_total) if f_total else 0.0,
             (100 * f_stats["UNKNOWN"] / f_total) if f_total else 0.0
         ))
         
-    print(f"{'=' * 95}\n{'NAZWA PLIKU':<40} | {'GUI':<10} | {'LOGIC':<10} | {'MIXED':<10} | {'UNKNOWN':<10}\n{'=' * 95}")
-    for r in table_rows: 
-        print(f"{r[0]:<40} | {r[1]:>8.1f}% | {r[2]:>8.1f}% | {r[3]:>8.1f}% | {r[4]:>8.1f}%")
-    g_total = sum(total_counts.values())
-    print(f"{'-' * 95}\n{'SUMA GLOBALNA':<40} | {(100*total_counts['GUI']/g_total):>8.1f}% | {(100*total_counts['LOGIC']/g_total):>8.1f}% | {(100*total_counts['MIXED']/g_total):>8.1f}% | {(100*total_counts['UNKNOWN']/g_total):>8.1f}%\n{'=' * 95}\n")
+    # DYNAMICZNE OBLICZANIE SZEROKOŚCI KOLUMNY 'NAME'
+    # Sprawdzamy najdłuższy wpis, ale ustawiamy minimum na 40 znaków
+    name_col_width = max(40, max((len(r[0]) for r in table_rows), default=40))
+    
+    # Budujemy separator o odpowiedniej długości
+    separator_line = "=" * (name_col_width + 55) # 55 to stała szerokość kolumn z procentami
+    dash_line = "-" * (name_col_width + 55)
 
+    print(separator_line)
+    print(f"{'NAME':<{name_col_width}} | {'GUI':<10} | {'LOGIC':<10} | {'MIXED':<10} | {'UNKNOWN':<10}")
+    print(separator_line)
+    
+    for r in table_rows: 
+        print(f"{r[0]:<{name_col_width}} | {r[1]:>8.1f}% | {r[2]:>8.1f}% | {r[3]:>8.1f}% | {r[4]:>8.1f}%")
+    
+    g_total = sum(total_counts.values())
+    if g_total:
+        print(dash_line)
+        print(f"{'TOTAL':<{name_col_width}} | {(100*total_counts['GUI']/g_total):>8.1f}% | {(100*total_counts['LOGIC']/g_total):>8.1f}% | {(100*total_counts['MIXED']/g_total):>8.1f}% | {(100*total_counts['UNKNOWN']/g_total):>8.1f}%")
+        print(separator_line + "\n")
+    else:
+        print(dash_line)
+        print(f"{'TOTAL pusta lub brak funkcji do przeanalizowania.'}")
+        print(separator_line + "\n")
 
 if __name__ == "__main__":
     main()
