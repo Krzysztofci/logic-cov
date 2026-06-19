@@ -149,3 +149,55 @@ gui/widgets.py                           |     25.8% |     14.4% |     35.1% |  
 TOTAL                                    |     49.5% |     34.9% |      3.7% |     11.9%
 ===============================================================================================
 
+
+4. Dynamic Comparison Mode -comp (Pytest Integration Gap Analysis)
+Command: logic-cov tests/ scripts/ -comp
+
+This mode bridges static tree parsing with dynamic test metrics. It intersects the lines identified by logic-cov as pure backend business logic (LOGIC/MIXED) with the actual unexecuted lines reported by pytest.
+
+Instead of showing absolute static targets, it calculates real-time Logic Coverage % and injects an intelligent syntax padding around the missing lines (e.g., automatically preserving parent control structures like if, for, or try), giving AI models the perfect contextual prompt needed to write missing test cases.
+
+====================================================================================
+====================== logic-cov: Logic Coverage Gap Analysis ======================
+Name                                     Logic Stmts    Covered    Missing  Logic Cover%
+------------------------------------------------------------------------------------
+scripts/glava-gui.py                             429          0        429            0%
+  ↳ Missing Logic: 76-95, 98-101, 148-179, 186-216, 371-375, 377-386, 489-530, 532-583, 715-719, 721-725, 762-764, 766-793, 799-800, 892-1010, 1021-1033, 1053-1110
+scripts/gui/__init__.py                            0          0          0          100%
+scripts/gui/color_button.py                       92          7         85            8%
+  ↳ Missing Logic: 37-75, 138-146, 160-170, 237-245, 253-269
+scripts/gui/colors.py                            160        160          0          100%
+scripts/gui/core.py                              107        107          0          100%
+scripts/gui/geometry.py                          157        153          4           97%
+  ↳ Missing Logic: 116-119
+scripts/gui/glava.py                             333        237         96           71%
+  ↳ Missing Logic: 35-38, 60-63, 131-142, 177-179, 223-233, 264-276, 283-286, 304-306, 320-325, 354-356, 364-367, 371-379, 387-389, 418-420, 431-444
+scripts/gui/instance.py                           98         98          0          100%
+scripts/gui/instance_tab_bar.py                   13          9          4           69%
+  ↳ Missing Logic: 367-370
+scripts/gui/modules/__init__.py                    0          0          0          100%
+scripts/gui/modules/bars.py                       49         49          0          100%
+scripts/gui/modules/base.py                       59         59          0          100%
+scripts/gui/modules/circle.py                     36         16         20           44%
+  ↳ Missing Logic: 184-186, 319-322, 324-326, 335-344
+scripts/gui/modules/glsl_io.py                   233        233          0          100%
+scripts/gui/modules/graph.py                      40         14         26           35%
+  ↳ Missing Logic: 217-222, 224-233, 235-244
+scripts/gui/modules/radial.py                     33         15         18           45%
+  ↳ Missing Logic: 410-413, 415-417, 419-429
+scripts/gui/modules/wave.py                       30         13         17           43%
+  ↳ Missing Logic: 207-209, 351-353, 355-365
+scripts/gui/tab_advanced.py                      108         34         74           31%
+  ↳ Missing Logic: 381-383, 390-393, 409-411, 433-463, 475-477, 481-496, 502-515
+scripts/gui/tab_main.py                          249        168         81           67%
+  ↳ Missing Logic: 293-299, 301-309, 339-373, 552-555, 600-603, 605-613, 645-647, 656-659, 679-681, 691-693
+scripts/gui/tab_module.py                         60         60          0          100%
+scripts/gui/theme.py                               6          3          3           50%
+  ↳ Missing Logic: 188-190
+scripts/gui/themes/__init__.py                     0          0          0          100%
+scripts/gui/widgets.py                            48          0         48            0%
+  ↳ Missing Logic: 11-44, 101-102, 104-108, 110-116
+------------------------------------------------------------------------------------
+TOTAL LOGIC                                     2340       1435        905           61%
+====================================================================================
+============================= target analysis finished =============================

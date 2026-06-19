@@ -4,6 +4,8 @@ import ast
 import sys
 import argparse
 from pathlib import Path
+import subprocess
+import re
 
 # --- Metric models ---
 METRIC_LINE = "line"
@@ -166,6 +168,8 @@ def parse_args():
     )
     parser.add_argument("-v", action="store_true", help="Show logic coverage targets")
     parser.add_argument("-vv", action="store_true", help="Show function classification dump")
+    # NOWA FLAGA DODANA MODUŁOWO:
+    parser.add_argument("-comp", action="store_true", help="Compare static targets with live pytest-cov results")
     return parser.parse_args()
 
 
@@ -181,37 +185,208 @@ def collect_files(paths):
     return sorted(files)
 
 
+# --- NOWE FUNKCJE POMOCNICZE DLA TRYBU -comp ---
+
+def parse_line_ranges(range_str):
+    """Konwertuje string zakresów pytest typu '40-45, 50' na zestaw liczb (set)"""
+    lines = set()
+    if not range_str.strip():
+        return lines
+    for part in range_str.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, end = map(int, part.split("-"))
+            lines.update(range(start, end + 1))
+        else:
+            lines.add(int(part))
+    return lines
+
+
+def format_set_to_ranges(line_set):
+    """Konwertuje set numerów linii z powrotem na czytelne zakresy tekstowe"""
+    if not line_set:
+        return ""
+    sorted_lines = sorted(list(line_set))
+    ranges = []
+    start = sorted_lines[0]
+    end = sorted_lines[0]
+    for line in sorted_lines[1:]:
+        if line == end + 1:
+            end = line
+        else:
+            ranges.append(f"{start}" if start == end else f"{start}-{end}")
+            start = line
+            end = line
+    ranges.append(f"{start}" if start == end else f"{start}-{end}")
+    return ", ".join(ranges)
+
+
+def run_and_parse_pytest(test_path, src_path):
+    """Uruchamia pytest w pamięci i parsuje brakujące linie z term-missing"""
+    cmd = ["pytest", str(test_path), "-v", f"--cov={src_path}", "--cov-report=term-missing"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        stdout = result.stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print(f"Error: Failed to run pytest command: {' '.join(cmd)}")
+        sys.exit(1)
+
+    coverage_data = {}
+    for line in stdout.splitlines():
+        if not line.strip() or line.startswith("---") or line.startswith("Name"):
+            continue
+        if ".py" in line:
+            parts = line.split()
+            if len(parts) >= 4:
+                pure_name = Path(parts[0]).name
+                if len(parts) > 4:
+                    missing_str = " ".join(parts[4:])
+                    coverage_data[pure_name] = parse_line_ranges(missing_str)
+                else:
+                    coverage_data[pure_name] = set()
+    return coverage_data
+
+
 def main():
     args = parse_args()
-    files = collect_files(args.paths)
+    
+    # Rozpoznanie katalogów przekazanych przez użytkownika
+    test_path = "tests"
+    src_path = "."
+    
+    if len(args.paths) >= 2:
+        test_candidates = [p for p in args.paths if "test" in p.lower()]
+        if test_candidates:
+            test_path = test_candidates[0]
+            src_candidates = [p for p in args.paths if p != test_path]
+            if src_candidates:
+                src_path = src_candidates[0]
+    elif len(args.paths) == 1:
+        if "test" in args.paths[0].lower():
+            test_path = args.paths[0]
+            src_path = "."
+        else:
+            src_path = args.paths[0]
+            test_path = "tests"
+
+    # Jeśli działamy w trybie -comp, analizujemy statycznie TYLKO kod źródłowy (omijamy tests/)
+    if args.comp:
+        files = collect_files([src_path])
+    else:
+        files = collect_files(args.paths)
 
     if not files:
         print("No .py files found in the specified directory.")
         sys.exit(1)
 
-    # We analyze each file exactly once and store the results in memory
+    # Analiza AST
     analyzed_data = []
     for path in files:
         data = process_file(path)
         if data:
             analyzed_data.append(data)
 
+    current_dir = Path.cwd()
+
+    # ---------------------------------------------------------------
+    # NOWY BLOK REPREZENTACJI: TRYB -comp 
+    # ---------------------------------------------------------------
+    if args.comp:
+        pytest_missing = run_and_parse_pytest(test_path, src_path)
+        pre_computed_rows = []
+        
+        for data in analyzed_data:
+            pure_name = data["path"].name
+            try:
+                display_name = str(data["path"].relative_to(current_dir))
+            except ValueError:
+                display_name = str(data["path"])
+                
+            # Wyciągamy zestaw wszystkich linii zakwalifikowanych jako LOGIC lub MIXED
+            logic_lines_set = set()
+            for start, end in data["untested_ranges"]:
+                logic_lines_set.update(range(start, end + 1))
+                
+            # Porównujemy z liniami, które pytest zaraportował jako niepokryte
+            file_missing_in_pytest = pytest_missing.get(pure_name, set())
+            
+            # --- NOWY BLOK: INTELIGENTNE UZUPEŁNIANIE KONTEKSTU (np. IF) ---
+            final_missing_logic = set()
+            for start, end in data["untested_ranges"]:
+                # Szukamy linii z tego konkretnego zakresu, których brakuje w pytest
+                actual_missing_in_range = set(range(start, end + 1)).intersection(file_missing_in_pytest)
+                
+                if actual_missing_in_range:
+                    final_missing_logic.update(actual_missing_in_range)
+                    
+                    # Sprawdzamy każdą brakującą linię i cofamy się o 1-2 linie, 
+                    # aby dołączyć instrukcje sterujące (if, for, try) z tej samej funkcji
+                    for line in actual_missing_in_range:
+                        for offset in (1, 2):
+                            parent_line = line - offset
+                            if parent_line >= start:
+                                final_missing_logic.add(parent_line)
+            # ---------------------------------------------------------------
+            
+            logic_stmts = len(logic_lines_set)
+            missing_count = len(final_missing_logic)
+            
+            # Zapobiegamy sytuacji, w której przez dodanie kontekstu 
+            # liczba braków przewyższyłaby całkowitą liczbę linii logiki
+            if missing_count > logic_stmts:
+                logic_stmts = missing_count
+                
+            covered_count = logic_stmts - missing_count
+            pct = (100 * covered_count / logic_stmts) if logic_stmts > 0 else 100.0
+            
+            pre_computed_rows.append({
+                "name": display_name,
+                "stmts": logic_stmts,
+                "covered": covered_count,
+                "missing": missing_count,
+                "pct_val": int(round(pct)),
+                "missing_str": format_set_to_ranges(final_missing_logic)
+            })
+
+        name_col_width = max(38, max((len(r["name"]) for r in pre_computed_rows), default=38))
+        total_header_width = name_col_width + 46
+        equal_line = "=" * total_header_width
+        dash_line = "-" * total_header_width
+
+        print(f"\n{equal_line}")
+        print(f" logic-cov: Logic Coverage Gap Analysis ".center(total_header_width, "="))
+        print(f"{'Name':<{name_col_width}} {'Logic Stmts':>13} {'Covered':>10} {'Missing':>10} {'Logic Cover%':>13}")
+        print(dash_line)
+
+        grand_total_logic = 0
+        grand_total_covered = 0
+        grand_total_missing = 0
+
+        for r in pre_computed_rows:
+            grand_total_logic += r["stmts"]
+            grand_total_covered += r["covered"]
+            grand_total_missing += r["missing"]
+            
+            pct_str = f"{r['pct_val']}%"
+            print(f"{r['name']:<{name_col_width}} {r['stmts']:>13} {r['covered']:>10} {r['missing']:>10} {pct_str:>13}")
+            
+            if r["missing_str"]:
+                print(f"  ↳ Missing Logic: {r['missing_str']}")
+
+        print(dash_line)
+        g_total_pct = (100 * grand_total_covered / grand_total_logic) if grand_total_logic > 0 else 100.0
+        print(f"{'TOTAL LOGIC':<{name_col_width}} {grand_total_logic:>13} {grand_total_covered:>10} {grand_total_missing:>10} {f'{int(round(g_total_pct))}%':>13}")
+        print(equal_line)
+        print(f" target analysis finished ".center(total_header_width, "="))
+        print()
+        return
+
     # --- OPTION 1: -v FLAG (Coverage report / pytest-cov) ---
-    # ---------------------------------------------------------------
-    # OPTION 1: Using the -v flag (Zabezpieczona przed rozjeżdżaniem)
-    # ---------------------------------------------------------------
-    # ---------------------------------------------------------------
-    # OPTION 1: Using the -v flag (Zabezpieczona przed rozjeżdżaniem)
-    # ---------------------------------------------------------------
     v_mode = args.v and not args.vv
     
     if v_mode:
-        current_dir = Path.cwd()
         pre_computed_rows = []
-        
-        # Pierwsze przejście: przygotowanie danych i konwersja ścieżek
         for data in analyzed_data:
-            # Próba skrócenia ścieżki do relatywnej
             try:
                 display_name = str(data["path"].relative_to(current_dir))
             except ValueError:
@@ -227,10 +402,7 @@ def main():
                 "missing": data["missing_str"] if data["total_func_lines"] > 0 else ""
             })
 
-        # Dynamiczne wyliczenie szerokości kolumny 'Name' (minimum 45 znaków)
         name_col_width = max(45, max((len(r["name"]) for r in pre_computed_rows), default=45))
-        
-        # Wyliczenie łącznej szerokości linii dekoracyjnych
         total_header_width = name_col_width + 50
         equal_line = "=" * total_header_width
         dash_line = "-" * total_header_width
@@ -243,11 +415,9 @@ def main():
         grand_total_stmts = 0
         grand_total_logic = 0
 
-        # Drugie przejście: renderowanie tabeli
         for r in pre_computed_rows:
             grand_total_stmts += r["stmts"]
             grand_total_logic += r["logic"]
-            
             print(f"{r['name']:<{name_col_width}} {r['stmts']:>7} {r['logic']:>7} {r['pct']}  {r['missing']}")
                 
         print(dash_line)
@@ -269,13 +439,11 @@ def main():
                     print(line)
         print(f"\n===================================== end of function dump ====================================\n")
 
-   # -------------------------------------------------------------
+    # -------------------------------------------------------------
     # DEFAULT PERCENTAGE TABLE (Zabezpieczona przed rozjeżdżaniem)
     # -------------------------------------------------------------
     table_rows = []
     total_counts = {"GUI": 0, "LOGIC": 0, "MIXED": 0, "UNKNOWN": 0}
-    
-    current_dir = Path.cwd()
     
     for data in analyzed_data:
         f_stats = data["f_stats"]
@@ -284,11 +452,10 @@ def main():
             
         f_total = sum(f_stats.values())
         
-        # Próba skrócenia ścieżki do relatywnej, by zaoszczędzić miejsce
         try:
             display_name = str(data["path"].relative_to(current_dir))
         except ValueError:
-            display_name = str(data["path"]) # Jeśli plik jest poza CWD, zostaw absolutną
+            display_name = str(data["path"])
 
         table_rows.append((
             display_name,
@@ -298,12 +465,8 @@ def main():
             (100 * f_stats["UNKNOWN"] / f_total) if f_total else 0.0
         ))
         
-    # DYNAMICZNE OBLICZANIE SZEROKOŚCI KOLUMNY 'NAME'
-    # Sprawdzamy najdłuższy wpis, ale ustawiamy minimum na 40 znaków
     name_col_width = max(40, max((len(r[0]) for r in table_rows), default=40))
-    
-    # Budujemy separator o odpowiedniej długości
-    separator_line = "=" * (name_col_width + 55) # 55 to stała szerokość kolumn z procentami
+    separator_line = "=" * (name_col_width + 55)
     dash_line = "-" * (name_col_width + 55)
 
     print(separator_line)
