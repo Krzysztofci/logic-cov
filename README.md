@@ -35,6 +35,8 @@ A mathematical ratio determines final category assignments:
 
 `logic-cov` is designed to be plug-and-play. It automatically scans the `scripts/` directory for Python files and offers three levels of granularity depending on your current objective.
 
+![logic-cov CLI Modes and Demonstration](logic-cov.png)
+
 Run the tool from your project root directory:
 
 ```bash
