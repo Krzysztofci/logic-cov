@@ -235,17 +235,28 @@ def run_and_parse_pytest(test_path, src_path):
     for line in stdout.splitlines():
         if not line.strip() or line.startswith("---") or line.startswith("Name"):
             continue
-        if ".py" in line:
-            parts = line.split()
-            if len(parts) >= 4:
-                pure_name = Path(parts[0]).name
-                if len(parts) > 4:
-                    missing_str = " ".join(parts[4:])
-                    coverage_data[pure_name] = parse_line_ranges(missing_str)
-                else:
-                    coverage_data[pure_name] = set()
-    return coverage_data
+        if ".py" not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        # Wiersz tabelki coverage MUSI mieć stmts/miss/cover% jako liczby
+        # na pozycjach 1-3. Jeśli nie — to szum z verbose pytest (np.
+        # nodeid z parametryzacją zawierającą spacje, "PASSED [ XX%]"),
+        # nie wiersz coverage. Ignorujemy bez crashowania.
+        try:
+            int(parts[1])
+            int(parts[2])
+        except ValueError:
+            continue
 
+        pure_name = Path(parts[0]).name
+        if len(parts) > 4:
+            missing_str = " ".join(parts[4:])
+            coverage_data[pure_name] = parse_line_ranges(missing_str)
+        else:
+            coverage_data[pure_name] = set()
+    return coverage_data
 
 def main():
     args = parse_args()
@@ -349,7 +360,7 @@ def main():
             })
 
         name_col_width = max(38, max((len(r["name"]) for r in pre_computed_rows), default=38))
-        total_header_width = name_col_width + 46
+        total_header_width = name_col_width + 50
         equal_line = "=" * total_header_width
         dash_line = "-" * total_header_width
 
