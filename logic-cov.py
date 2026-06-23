@@ -159,16 +159,21 @@ def process_file(path):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        prog="logic-scan",
+        prog="logic-cov",
         description="GUI/LOGIC analyzer for Python projects"
     )
+    # DEFINIUJEMY NAJPIERW TESTY, POTEM ŹRÓDŁA:
     parser.add_argument(
-        "paths", nargs="*", default=["."],
-        help="Files or directories to scan (default: current directory)"
+        "test_path", nargs="?", default="tests",
+        help="Directory containing pytest tests (default: 'tests')"
     )
+    parser.add_argument(
+        "src_path", nargs="?", default=".",
+        help="Directory containing application source code (default: current directory)"
+    )
+    
     parser.add_argument("-v", action="store_true", help="Show logic coverage targets")
     parser.add_argument("-vv", action="store_true", help="Show function classification dump")
-    # NOWA FLAGA DODANA MODUŁOWO:
     parser.add_argument("-comp", action="store_true", help="Compare static targets with live pytest-cov results")
     return parser.parse_args()
 
@@ -223,13 +228,28 @@ def format_set_to_ranges(line_set):
 
 def run_and_parse_pytest(test_path, src_path):
     """Uruchamia pytest w pamięci i parsuje brakujące linie z term-missing"""
-    cmd = ["pytest", str(test_path), "-v", f"--cov={src_path}", "--cov-report=term-missing"]
+    # Zastępujemy "pytest" dynamicznym wywołaniem aktualnego interpretera z flagą -m pytest
+    cmd = [
+        sys.executable, "-m", "pytest", 
+        str(test_path), 
+        "-v", 
+        f"--cov={src_path}", 
+        "--cov-report=term-missing"
+    ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # Dodajemy env=os.environ, aby przekazać zmienne środowiskowe, np. PYTHONPATH
+        import os
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=os.environ)
         stdout = result.stdout
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        # Dodatkowa korzyść: wypisujemy prawdziwy błąd (stderr), żeby wiedzieć, co poszło nie tak
+        stderr_output = getattr(e, "stderr", "")
         print(f"Error: Failed to run pytest command: {' '.join(cmd)}")
+        if stderr_output:
+            print(f"Pytest Output:\n{stderr_output}")
         sys.exit(1)
+    
+    # ... reszta kodu parsowania bez zmian ...
 
     coverage_data = {}
     for line in stdout.splitlines():
@@ -261,30 +281,18 @@ def run_and_parse_pytest(test_path, src_path):
 def main():
     args = parse_args()
     
-    # Rozpoznanie katalogów przekazanych przez użytkownika
-    test_path = "tests"
-    src_path = "."
-    
-    if len(args.paths) >= 2:
-        test_candidates = [p for p in args.paths if "test" in p.lower()]
-        if test_candidates:
-            test_path = test_candidates[0]
-            src_candidates = [p for p in args.paths if p != test_path]
-            if src_candidates:
-                src_path = src_candidates[0]
-    elif len(args.paths) == 1:
-        if "test" in args.paths[0].lower():
-            test_path = args.paths[0]
-            src_path = "."
-        else:
-            src_path = args.paths[0]
-            test_path = "tests"
+    # Przejrzyste przypisanie z argparse
+    test_path = args.test_path
+    src_path = args.src_path
 
-    # Jeśli działamy w trybie -comp, analizujemy statycznie TYLKO kod źródłowy (omijamy tests/)
+    # Jeśli działamy w trybie -comp, analizujemy statycznie TYLKO kod źródłowy
     if args.comp:
         files = collect_files([src_path])
     else:
-        files = collect_files(args.paths)
+        # W standardowym trybie analizujemy oba podane foldery
+        files = collect_files([src_path, test_path])
+
+    # ... reszta kodu bez zmian ...
 
     if not files:
         print("No .py files found in the specified directory.")
