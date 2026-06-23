@@ -34,16 +34,51 @@ LOGIC_HINTS = {
 GUI_NAME_HINTS = ["build", "show", "hide", "ui", "widget", "panel", "frame", "tab", "window", "render"]
 LOGIC_NAME_HINTS = ["load", "save", "read", "write", "calc", "fetch", "get", "set", "update", "check", "parse", "process"]
 
+# Metody magiczne Pythona realizujące czystą logikę strukturalną/porównawczą
+MAGIC_LOGIC_METHODS = {
+    "__init__", "__str__", "__repr__", "__eq__", "__ne__", 
+    "__lt__", "__le__", "__gt__", "__ge__", "__hash__", 
+    "__enter__", "__exit__", "__call__", "__iter__", "__next__"
+}
+
 class Analyzer(ast.NodeVisitor):
-    def __init__(self, func_name=""):
+    def __init__(self, func_name="", has_gui_imports=False):
         self.gui = 0
         self.logic = 0
+        self.has_control_flow = False
+        self.has_gui_imports = has_gui_imports
         
         func_name_lower = func_name.lower()
+      
+        # Jeśli to metoda magiczna - z definicji dajemy bazowe punkty do LOGIC
+        if func_name in MAGIC_LOGIC_METHODS:
+            self.logic += 2
+
+        # Analiza podpowiedzi w nazwie funkcji z uwzględnieniem kontekstu importów
         if any(hint in func_name_lower for hint in GUI_NAME_HINTS):
-            self.gui += 2
+            if self.has_gui_imports:
+                self.gui += 2
+            else:
+                self.logic += 1  # Jeśli plik nie importuje GUI, słowa typu 'build' oznaczają logikę
         if any(hint in func_name_lower for hint in LOGIC_NAME_HINTS):
             self.logic += 2
+
+    # Śledzenie struktur sterujących (jeśli występują, funkcja rzadko jest "UNKNOWN")
+    def visit_If(self, node):
+        self.has_control_flow = True
+        self.generic_visit(node)
+
+    def visit_For(self, node):
+        self.has_control_flow = True
+        self.generic_visit(node)
+
+    def visit_While(self, node):
+        self.has_control_flow = True
+        self.generic_visit(node)
+
+    def visit_Try(self, node):
+        self.has_control_flow = True
+        self.generic_visit(node)
 
     def visit_Call(self, node):
         name = self._name(node.func)
@@ -51,15 +86,18 @@ class Analyzer(ast.NodeVisitor):
             parts = name.split(".")
             short = parts[-1]
 
-            # GUI verification
+            # Weryfikacja GUI z uwzględnieniem kontekstu importów pliku
             if (
                 short in GUI_HINTS
                 or short in GUI_WIDGETS
-                or any(p.lower() in ["tk", "ttk", "theme", "style"] for p in parts)
+                or any(p.lower() in ["tk", "ttk", "theme", "style", "customtkinter"] for p in parts)
             ):
-                self.gui += 1
+                if self.has_gui_imports or any(p.lower() in ["tk", "ttk", "customtkinter"] for p in parts):
+                    self.gui += 1
+                else:
+                    self.logic += 1
 
-            # LOGIC verification (precise segment matching instead of substrings)
+            # Weryfikacja LOGIC
             elif (
                 short in LOGIC_HINTS 
                 or any(p in LOGIC_HINTS for p in parts)
@@ -79,17 +117,21 @@ class Analyzer(ast.NodeVisitor):
                 return f"{base}.{node.attr}"
             return node.attr
         if isinstance(node, ast.Call):
-            # Handling call chains, e.g., get_widget().pack() -> extracting the trailing dot
             return self._name(node.func)
         return None
 
 
-def analyze_function(node):
-    a = Analyzer(func_name=node.name)
+def analyze_function(node, has_gui_imports=False):
+    a = Analyzer(func_name=node.name, has_gui_imports=has_gui_imports)
     a.visit(node)
 
     gui = a.gui
     logic = a.logic
+    
+    # Fallback: jeśli brak jednoznacznych cech, ale jest struktura sterująca, to LOGIC
+    if gui == 0 and logic == 0 and a.has_control_flow:
+        logic += 1
+
     total = gui + logic
 
     if total == 0:
@@ -116,6 +158,21 @@ def process_file(path):
     except Exception:
         return None
 
+    # Skonstruowanie kontekstu importów dla pliku (Poziom 1)
+    has_gui_imports = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if any(gui in alias.name.lower() for gui in ["tkinter", "customtkinter", "pyqt", "kivy", "wx"]):
+                    has_gui_imports = True
+                    break
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and any(gui in node.module.lower() for gui in ["tkinter", "customtkinter", "pyqt", "kivy", "wx"]):
+                has_gui_imports = True
+                break
+        if has_gui_imports:
+            break
+
     file_results = {
         "path": path,
         "total_func_lines": 0,
@@ -127,12 +184,12 @@ def process_file(path):
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            kind, gui, logic = analyze_function(node)
+            kind, gui, logic = analyze_function(node, has_gui_imports=has_gui_imports)
             
             start_line = node.lineno
             end_line = getattr(node, "end_lineno", start_line)
             lines_in_func = (end_line - start_line) + 1
-            
+             
             file_results["total_func_lines"] += lines_in_func
             file_results["f_stats"][kind] += lines_in_func
             
@@ -162,7 +219,6 @@ def parse_args():
         prog="logic-cov",
         description="GUI/LOGIC analyzer for Python projects"
     )
-    # DEFINIUJEMY NAJPIERW TESTY, POTEM ŹRÓDŁA:
     parser.add_argument(
         "test_path", nargs="?", default="tests",
         help="Directory containing pytest tests (default: 'tests')"
@@ -175,25 +231,27 @@ def parse_args():
     parser.add_argument("-v", action="store_true", help="Show logic coverage targets")
     parser.add_argument("-vv", action="store_true", help="Show function classification dump")
     parser.add_argument("-comp", action="store_true", help="Compare static targets with live pytest-cov results")
+    parser.add_argument("--include-venv", action="store_true", help="Do not ignore .venv and site-packages directories")
     return parser.parse_args()
 
 
-def collect_files(paths):
+def collect_files(paths, include_venv=False):
     files = set()
     for item in paths:
         path = Path(item)
         if path.is_file() and path.suffix == ".py":
+            if not include_venv and any(p in path.parts for p in [".venv", "site-packages", "__pycache__"]):
+                continue
             files.add(path.resolve())
         elif path.is_dir():
             for f in path.rglob("*.py"):
+                if not include_venv and any(p in f.parts for p in [".venv", "site-packages", "__pycache__"]):
+                    continue
                 files.add(f.resolve())
     return sorted(files)
 
 
-# --- NOWE FUNKCJE POMOCNICZE DLA TRYBU -comp ---
-
 def parse_line_ranges(range_str):
-    """Konwertuje string zakresów pytest typu '40-45, 50' na zestaw liczb (set)"""
     lines = set()
     if not range_str.strip():
         return lines
@@ -208,7 +266,6 @@ def parse_line_ranges(range_str):
 
 
 def format_set_to_ranges(line_set):
-    """Konwertuje set numerów linii z powrotem na czytelne zakresy tekstowe"""
     if not line_set:
         return ""
     sorted_lines = sorted(list(line_set))
@@ -227,8 +284,6 @@ def format_set_to_ranges(line_set):
 
 
 def run_and_parse_pytest(test_path, src_path):
-    """Uruchamia pytest w pamięci i parsuje brakujące linie z term-missing"""
-    # Zastępujemy "pytest" dynamicznym wywołaniem aktualnego interpretera z flagą -m pytest
     cmd = [
         sys.executable, "-m", "pytest", 
         str(test_path), 
@@ -237,33 +292,26 @@ def run_and_parse_pytest(test_path, src_path):
         "--cov-report=term-missing"
     ]
     try:
-        # Dodajemy env=os.environ, aby przekazać zmienne środowiskowe, np. PYTHONPATH
         import os
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=os.environ)
         stdout = result.stdout
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        # Dodatkowa korzyść: wypisujemy prawdziwy błąd (stderr), żeby wiedzieć, co poszło nie tak
         stderr_output = getattr(e, "stderr", "")
         print(f"Error: Failed to run pytest command: {' '.join(cmd)}")
         if stderr_output:
             print(f"Pytest Output:\n{stderr_output}")
         sys.exit(1)
     
-    # ... reszta kodu parsowania bez zmian ...
-
     coverage_data = {}
     for line in stdout.splitlines():
         if not line.strip() or line.startswith("---") or line.startswith("Name"):
             continue
         if ".py" not in line:
             continue
+    
         parts = line.split()
         if len(parts) < 4:
             continue
-        # Wiersz tabelki coverage MUSI mieć stmts/miss/cover% jako liczby
-        # na pozycjach 1-3. Jeśli nie — to szum z verbose pytest (np.
-        # nodeid z parametryzacją zawierającą spacje, "PASSED [ XX%]"),
-        # nie wiersz coverage. Ignorujemy bez crashowania.
         try:
             int(parts[1])
             int(parts[2])
@@ -281,24 +329,18 @@ def run_and_parse_pytest(test_path, src_path):
 def main():
     args = parse_args()
     
-    # Przejrzyste przypisanie z argparse
     test_path = args.test_path
     src_path = args.src_path
 
-    # Jeśli działamy w trybie -comp, analizujemy statycznie TYLKO kod źródłowy
     if args.comp:
-        files = collect_files([src_path])
+        files = collect_files([src_path], include_venv=args.include_venv)
     else:
-        # W standardowym trybie analizujemy oba podane foldery
-        files = collect_files([src_path, test_path])
-
-    # ... reszta kodu bez zmian ...
+        files = collect_files([src_path, test_path], include_venv=args.include_venv)
 
     if not files:
         print("No .py files found in the specified directory.")
         sys.exit(1)
 
-    # Analiza AST
     analyzed_data = []
     for path in files:
         data = process_file(path)
@@ -307,9 +349,7 @@ def main():
 
     current_dir = Path.cwd()
 
-    # ---------------------------------------------------------------
-    # NOWY BLOK REPREZENTACJI: TRYB -comp 
-    # ---------------------------------------------------------------
+    # --- TRYB -comp ---
     if args.comp:
         pytest_missing = run_and_parse_pytest(test_path, src_path)
         pre_computed_rows = []
@@ -321,40 +361,31 @@ def main():
             except ValueError:
                 display_name = str(data["path"])
                 
-            # Wyciągamy zestaw wszystkich linii zakwalifikowanych jako LOGIC lub MIXED
             logic_lines_set = set()
             for start, end in data["untested_ranges"]:
                 logic_lines_set.update(range(start, end + 1))
                 
-            # Porównujemy z liniami, które pytest zaraportował jako niepokryte
             file_missing_in_pytest = pytest_missing.get(pure_name, set())
             
-            # --- NOWY BLOK: INTELIGENTNE UZUPEŁNIANIE KONTEKSTU (np. IF) ---
             final_missing_logic = set()
             for start, end in data["untested_ranges"]:
-                # Szukamy linii z tego konkretnego zakresu, których brakuje w pytest
                 actual_missing_in_range = set(range(start, end + 1)).intersection(file_missing_in_pytest)
                 
                 if actual_missing_in_range:
                     final_missing_logic.update(actual_missing_in_range)
                     
-                    # Sprawdzamy każdą brakującą linię i cofamy się o 1-2 linie, 
-                    # aby dołączyć instrukcje sterujące (if, for, try) z tej samej funkcji
                     for line in actual_missing_in_range:
                         for offset in (1, 2):
                             parent_line = line - offset
                             if parent_line >= start:
                                 final_missing_logic.add(parent_line)
-            # ---------------------------------------------------------------
             
             logic_stmts = len(logic_lines_set)
             missing_count = len(final_missing_logic)
             
-            # Zapobiegamy sytuacji, w której przez dodanie kontekstu 
-            # liczba braków przewyższyłaby całkowitą liczbę linii logiki
             if missing_count > logic_stmts:
                 logic_stmts = missing_count
-                
+                 
             covered_count = logic_stmts - missing_count
             pct = (100 * covered_count / logic_stmts) if logic_stmts > 0 else 100.0
             
@@ -400,9 +431,8 @@ def main():
         print()
         return
 
-    # --- OPTION 1: -v FLAG (Coverage report / pytest-cov) ---
+    # --- TRYB -v ---
     v_mode = args.v and not args.vv
-    
     if v_mode:
         pre_computed_rows = []
         for data in analyzed_data:
@@ -428,7 +458,7 @@ def main():
 
         print(f"\n{equal_line}")
         print(f" logic test-targets: platform analysis ".center(total_header_width, "="))
-        print(f"{'Name':<{name_col_width}} {'Stmts':>7} {'Logic':>7} {'Target%':>7}  {'Logic Lines'}")
+        print(f"{'Name':<{name_col_width}} {'Stmts':>7} {'Logic':>7} {'Target%':>7}")
         print(dash_line)
         
         grand_total_stmts = 0
@@ -437,7 +467,10 @@ def main():
         for r in pre_computed_rows:
             grand_total_stmts += r["stmts"]
             grand_total_logic += r["logic"]
-            print(f"{r['name']:<{name_col_width}} {r['stmts']:>7} {r['logic']:>7} {r['pct']}  {r['missing']}")
+            print(f"{r['name']:<{name_col_width}} {r['stmts']:>7} {r['logic']:>7} {r['pct']}")
+            # Poprawka formatowania: informacja o brakujących liniach wypisuje się w nowej linii TYLKO gdy faktycznie istnieją
+            if r["missing"]:
+                print(f"  ↳ Target Logic Lines: {r['missing']}")
                 
         print(dash_line)
         total_pct = (100 * grand_total_logic / grand_total_stmts) if grand_total_stmts else 0.0
@@ -447,7 +480,7 @@ def main():
         print()
         return
 
-    # --- OPTION 2: -vv FLAG (Detailed per-function output) ---
+    # --- TRYB -vv ---
     if args.vv:
         print(f"\n==================================== verbose function dump ====================================")
         for data in analyzed_data:
@@ -458,9 +491,7 @@ def main():
                     print(line)
         print(f"\n===================================== end of function dump ====================================\n")
 
-    # -------------------------------------------------------------
-    # DEFAULT PERCENTAGE TABLE (Zabezpieczona przed rozjeżdżaniem)
-    # -------------------------------------------------------------
+    # --- DOMYŚLNA TABELA PROCENTOWA ---
     table_rows = []
     total_counts = {"GUI": 0, "LOGIC": 0, "MIXED": 0, "UNKNOWN": 0}
     
@@ -470,7 +501,6 @@ def main():
             total_counts[k] += f_stats[k]
             
         f_total = sum(f_stats.values())
-        
         try:
             display_name = str(data["path"].relative_to(current_dir))
         except ValueError:
